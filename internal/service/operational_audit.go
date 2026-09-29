@@ -126,15 +126,26 @@ func (p *Plant) OperationalAudit() map[string]any {
 
 	events := p.Journal.Events()
 	sequenceErr := journal.ValidateSequence(events)
-	latestEvent, latestEventPresent := journal.Latest(events)
+	_, latestEventPresent := journal.Latest(events)
+	recovery := p.RecoveryStatus()
 	checkpointValid := false
-	if latestEventPresent {
-		checkpoint := journal.NewCheckpoint(latestEvent)
-		checkpointValid = checkpoint.Valid(latestEvent)
+	trustedSeq, confirmedSeq := uint64(0), uint64(0)
+	manualReview, quarantinePresent := false, false
+	legacyMigrated := 0
+	if recovery != nil {
+		checkpointValid = recovery.Checkpoint.Valid
+		trustedSeq = recovery.TrustedSeq
+		confirmedSeq = recovery.ConfirmedSeq
+		manualReview = recovery.ManualReview
+		quarantinePresent = recovery.Quarantined != nil
+		legacyMigrated = recovery.LegacyMigrated
 	}
-	fileEvents, fileReadErr := p.FileLog.Read()
+	durableEnvelopes, _, durableTail, fileReadErr := p.Durable.Scan()
+	fileEvents := len(durableEnvelopes)
+	_ = durableTail
 	_, durableProofPresent := p.Journal.Last("proof.durable")
 	durableProofErr := journal.RequireProof(p.Journal, revision)
+	durableProofConfirmed := journal.RequireProofConfirmed(p.Journal, revision, confirmedSeq) == nil
 	recoveryValidationErr := journal.ValidateRecovery(snapshot, events)
 	recoveryEvents := journal.RecoveryEvents(p.Journal, current.ID.String())
 	replay := journal.NewReplay(events)
@@ -308,7 +319,7 @@ func (p *Plant) OperationalAudit() map[string]any {
 		"column":    map[string]any{"apply_error": auditError(columnApplyErr), "ready": columnReady, "snapshot_valid": columnSnapshotValid, "stable": columnStable, "heat_permit": columnHeatPermit, "recovery_ready": columnRecoveryReady, "profile_count": p.Profile.Count()},
 		"feed":      map[string]any{"switch_error": auditError(feedSwitchErr), "proof_error": auditError(feedProofErr), "proof_safe": feedProof.Safe(), "built_proof_safe": feedBuiltProof.Safe(), "route_isolated": feedCoordinator.Current.Isolated(), "route_event": feedRouteEvent.ID, "open_error": auditError(feedOpenErr), "active": feedActive, "revision": feedStateRevision, "close_error": auditError(feedCloseErr), "metrics": feedMetricSnapshot},
 		"interlock": map[string]any{"explanation": explanation, "sources": evidenceSources, "same_source": sameSource, "heat": heatPermit.Allowed, "route": routePermit, "restored": restoredPermit.Allowed, "recovery_safe": recoverySafe},
-		"journal":   map[string]any{"sequence_error": auditError(sequenceErr), "latest": latestEventPresent, "checkpoint_valid": checkpointValid, "file_path": p.FileLog.Path(), "file_events": len(fileEvents), "file_error": auditError(fileReadErr), "durable_proof": durableProofPresent, "proof_error": auditError(durableProofErr), "recovery_error": auditError(recoveryValidationErr), "recovery_events": len(recoveryEvents), "replay_events": len(replayEvents), "campaign_events": replayedForCampaign, "state_ready": recoveredState.Ready(), "plan_complete": recoveryPlan.Complete(), "generations": len(eventGenerations), "loaded_campaign": loadedSnapshot.Campaign.ID, "load_error": auditError(snapshotLoadErr), "failure_probe_rejected": journalProbeErr != nil},
+		"journal":   map[string]any{"sequence_error": auditError(sequenceErr), "latest": latestEventPresent, "checkpoint_valid": checkpointValid, "file_path": p.Durable.Path(), "file_events": fileEvents, "file_error": auditError(fileReadErr), "durable_proof": durableProofPresent, "durable_proof_confirmed": durableProofConfirmed, "proof_error": auditError(durableProofErr), "recovery_error": auditError(recoveryValidationErr), "recovery_events": len(recoveryEvents), "replay_events": len(replayEvents), "campaign_events": replayedForCampaign, "state_ready": recoveredState.Ready(), "plan_complete": recoveryPlan.Complete(), "generations": len(eventGenerations), "trusted_seq": trustedSeq, "confirmed_seq": confirmedSeq, "manual_review": manualReview, "quarantine_present": quarantinePresent, "legacy_migrated": legacyMigrated, "loaded_campaign": loadedSnapshot.Campaign.ID, "load_error": auditError(snapshotLoadErr), "failure_probe_rejected": journalProbeErr != nil},
 		"model":     map[string]any{"plan_error": auditError(planErr), "command_error": auditError(commandErr), "command_key": command.Key(), "ack_matches": ackMatches, "ack_error": auditError(ackErr), "column_limit_error": auditError(columnLimitErr), "energy_limit_error": auditError(energyLimitErr), "safe": limitSafe},
 		"product":   map[string]any{"publish_error": auditError(productPublishErr), "recover_error": auditError(productRecoverErr), "route_error": auditError(productRouteErr), "closed_for_revision": productClose, "transition_error": auditError(productTransitionErr), "durable": productDurable, "routed": productRouted, "recovery_error": auditError(productRecoveryErr), "restore_error": auditError(productRestoreErr), "latest": productLatest, "latest_error": auditError(productLatestErr), "revision_decisions": len(productByRevision), "state_present": productStatePresent, "state_targets": productStateTargets},
 		"reboiler":  map[string]any{"restore_error": auditError(reboilerRestoreErr), "ramp_error": auditError(reboilerRampErr), "trip_error": auditError(reboilerTripErr), "permit": reboilerPermit, "ramp_apply_error": auditError(reboilerRampApplyErr), "recoverable": reboilerRecoverable, "confirmed": reboilerConfirmed},

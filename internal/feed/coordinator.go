@@ -7,12 +7,13 @@ import (
 )
 
 type Transition struct {
-	Stage     string
-	OldSource string
-	OldOpen   bool
-	OldFlow   float64
-	NewSource string
-	NewOpen   bool
+	Stage       string
+	OldSource   string
+	OldOpen     bool
+	OldFlow     float64
+	NewSource   string
+	NewOpen     bool
+	NewRevision string
 }
 
 type Coordinator struct {
@@ -54,6 +55,7 @@ func (c *Coordinator) emit(stage string, old, next *Route) {
 	if next != nil {
 		value.NewSource = next.Source
 		value.NewOpen = next.Open
+		value.NewRevision = next.Revision.String()
 	}
 	c.Observe(value)
 }
