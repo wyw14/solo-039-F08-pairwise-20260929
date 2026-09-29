@@ -39,6 +39,7 @@ type Plant struct {
 	Journal           *journal.Store
 	FileLog           *journal.FileLog
 	Snapshots         *journal.SnapshotFile
+	Checkpoints       *journal.CheckpointFile
 	FeedMetrics       *feed.Metrics
 	RefluxTelemetry   *reflux.Telemetry
 	ReboilerTelemetry *reboiler.Telemetry
@@ -54,6 +55,12 @@ type Plant struct {
 	Incidents         *Incidents
 	started           bool
 	lastError         string
+	boundary          *journal.Boundary
+	confirmed         map[string]struct{}
+	generations       []string
+	manual            []journal.ManualReview
+	bindError         string
+	replayStats       replayStats
 }
 
 func NewPlant(dataDir string) *Plant {
@@ -77,6 +84,7 @@ func NewPlant(dataDir string) *Plant {
 		Journal:           store,
 		FileLog:           journal.NewFileLog(filepath.Join(dataDir, "events.jsonl")),
 		Snapshots:         journal.NewSnapshotFile(filepath.Join(dataDir, "snapshot.json")),
+		Checkpoints:       journal.NewCheckpointFile(filepath.Join(dataDir, "checkpoint.json")),
 		FeedMetrics:       feed.NewMetrics(),
 		RefluxTelemetry:   reflux.NewTelemetry(),
 		ReboilerTelemetry: reboiler.NewTelemetry(),
@@ -249,26 +257,183 @@ func (p *Plant) Snapshot() model.Snapshot {
 
 func (p *Plant) Save() error { return p.Snapshots.Save(p.Snapshot()) }
 
+// Restore rebuilds the plant from durable state. It verifies the event hash
+// chain, isolates any corrupt tail for manual review, binds the persisted
+// checkpoint and replays only the events inside the last trusted boundary that
+// were not already confirmed. Confirmed actions are never executed twice;
+// anything that cannot be proven safe is parked for manual review instead of
+// being replayed.
 func (p *Plant) Restore() error {
-	snapshot, err := p.Snapshots.Load()
+	snapshot, snapshotErr := p.Snapshots.Load()
+
+	// Resolve the durable frontier first: this verifies the chain and moves a
+	// torn or tampered tail into quarantine before anything reads it.
+	boundary, err := journal.ResolveBoundary(p.FileLog, p.Checkpoints)
 	if err != nil {
 		return err
 	}
-	campaign.Restore(p.Campaign, snapshot.Campaign)
-	column.Restore(p.Column, snapshot.Column)
-	if err := reboiler.Restore(p.Reboiler, snapshot.Reboiler, snapshot.Campaign); err != nil {
-		return err
+
+	confirmed := make(map[string]struct{})
+	for _, id := range boundary.Checkpoint.Confirmed {
+		confirmed[id] = struct{}{}
 	}
-	if err := journal.ValidateRecovery(snapshot, p.Journal.Events()); err != nil {
-		return err
+	generations := make([]string, 0)
+	genSeen := make(map[string]struct{})
+	if boundary.CheckpointPresent && len(boundary.Checkpoint.Generations) > 0 {
+		for _, g := range boundary.Checkpoint.Generations {
+			if _, ok := genSeen[g]; !ok {
+				genSeen[g] = struct{}{}
+				generations = append(generations, g)
+			}
+		}
 	}
+
+	// New writer incarnation: resume above the highest durable batch so records
+	// written after this restart are attributable to this replay generation.
+	var maxBatch uint64
+	for _, rec := range boundary.TrustedRecords {
+		if rec.Batch > maxBatch {
+			maxBatch = rec.Batch
+		}
+		if _, ok := genSeen[rec.Revision]; !ok {
+			genSeen[rec.Revision] = struct{}{}
+			generations = append(generations, rec.Revision)
+		}
+	}
+	p.FileLog.SetBatch(maxBatch)
+	p.FileLog.BeginBatch()
+
+	// Restore the richer subsystem snapshot first. A snapshot that trails the
+	// durable log is expected: the replay suffix below brings it forward, so
+	// validation only covers the prefix the snapshot actually represents.
+	snapshotRestored := false
+	if snapshotErr == nil {
+		campaign.Restore(p.Campaign, snapshot.Campaign)
+		column.Restore(p.Column, snapshot.Column)
+		if err := reboiler.Restore(p.Reboiler, snapshot.Reboiler, snapshot.Campaign); err != nil {
+			return err
+		}
+		covered := make([]model.Event, 0)
+		for _, event := range boundary.TrustedEvents {
+			if event.Epoch <= snapshot.Campaign.Epoch {
+				covered = append(covered, event)
+			}
+		}
+		if err := journal.ValidateRecovery(snapshot, covered); err != nil {
+			return err
+		}
+		snapshotRestored = true
+	}
+
+	// Load the verified prefix into the read model and walk the per-event
+	// disposition. Only "replay" decisions execute recovery actions; confirmed
+	// events are skipped (idempotency across restarts) and reviewed events are
+	// left well alone.
+	replayed, skipped, reviewed := 0, 0, 0
+	for _, decision := range boundary.Decisions {
+		// The in-memory journal is a read model of durable truth, so every
+		// verified event is visible regardless of its action disposition.
+		if err := p.Journal.Append(decision.Event); err != nil {
+			return err
+		}
+		switch decision.Action {
+		case journal.ActionReplay:
+			p.applyReplayedEvent(decision.Event)
+			confirmed[decision.Event.ID.String()] = struct{}{}
+			replayed++
+		case journal.ActionSkipConfirmed, journal.ActionSkipCheckpoint:
+			skipped++
+		case journal.ActionManualReview:
+			reviewed++
+		}
+	}
+
+	if snapshotRestored {
+		p.mu.Lock()
+		p.started = snapshot.Campaign.Phase != model.Stopped
+		p.mu.Unlock()
+		if !model.PhaseAllowsHeat(snapshot.Campaign.Phase) {
+			p.Reboiler.Stop()
+		}
+	}
+
+	// Replay succeeded: publish a checkpoint over the new head so a repeat
+	// restart skips everything just applied. Open manual reviews stay bound.
+	if replayed > 0 || (boundary.CheckpointPresent && !boundary.CheckpointBound) {
+		if cpErr := p.persistCheckpoint(confirmed, generations, boundary.Manual); cpErr != nil {
+			return cpErr
+		}
+	}
+
 	p.mu.Lock()
-	p.started = snapshot.Campaign.Phase != model.Stopped
+	p.boundary = boundary
+	p.confirmed = confirmed
+	p.generations = generations
+	p.manual = append([]journal.ManualReview(nil), boundary.Manual...)
+	p.bindError = boundary.BindError
+	p.replayStats = replayStats{replayed: replayed, skipped: skipped, reviewed: reviewed}
 	p.mu.Unlock()
-	if !model.PhaseAllowsHeat(snapshot.Campaign.Phase) {
-		p.Reboiler.Stop()
-	}
 	return nil
+}
+
+// applyReplayedEvent re-applies the idempotent state projection for one event.
+// Side-effecting actions are intentionally NOT re-invoked here; the event only
+// moves campaign revision/epoch forward, which is what downstream fencing and
+// proof checks read.
+func (p *Plant) applyReplayedEvent(event model.Event) {
+	current := p.Campaign.Snapshot()
+	current.Revision = event.Revision
+	current.Epoch = event.Epoch
+	campaign.Restore(p.Campaign, current)
+}
+
+func (p *Plant) persistCheckpoint(confirmed map[string]struct{}, generations []string, manual []journal.ManualReview) error {
+	ids := make([]string, 0, len(confirmed))
+	for id := range confirmed {
+		ids = append(ids, id)
+	}
+	cp, err := p.FileLog.Checkpoint(ids, generations, manual)
+	if err != nil {
+		return err
+	}
+	if !cp.Exists() {
+		return nil
+	}
+	return p.Checkpoints.Save(cp)
+}
+
+// RecoveryReview reports the durable recovery state for operators: any corrupt
+// tail that was quarantined, any checkpoint that failed to bind, and the steps
+// parked for manual inspection.
+func (p *Plant) RecoveryReview() map[string]any {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	manual := append([]journal.ManualReview(nil), p.manual...)
+	stats := p.replayStats
+	return map[string]any{
+		"needs_review":       len(manual) > 0 || p.bindError != "",
+		"manual_review":      manual,
+		"checkpoint_bound":   p.boundary != nil && p.boundary.CheckpointBound,
+		"checkpoint_present": p.boundary != nil && p.boundary.CheckpointPresent,
+		"bind_error":         p.bindError,
+		"quarantine":         quarantinePath(p.boundary),
+		"replayed":           stats.replayed,
+		"skipped_confirmed":  stats.skipped,
+		"held_for_review":    stats.reviewed,
+	}
+}
+
+type replayStats struct {
+	replayed int
+	skipped  int
+	reviewed int
+}
+
+func quarantinePath(b *journal.Boundary) string {
+	if b == nil {
+		return ""
+	}
+	return b.Quarantine
 }
 
 func (p *Plant) ProductTargets() []string {
@@ -293,10 +458,39 @@ func (p *Plant) record(kind, payload string) error {
 	if err := p.Journal.Append(event); err != nil {
 		return err
 	}
+	// FileLog.Append seals the chained record, fsyncs and verifies readback;
+	// it fails closed rather than reporting an unverified write as durable.
 	if err := p.FileLog.Append(event); err != nil {
 		return err
 	}
-	return p.Save()
+	if err := p.Save(); err != nil {
+		return err
+	}
+	// Advance the durable boundary to the now-proven chain head and mark this
+	// action confirmed, so a crash immediately after still never re-executes it.
+	p.mu.Lock()
+	if p.confirmed == nil {
+		p.confirmed = make(map[string]struct{})
+	}
+	p.confirmed[event.ID.String()] = struct{}{}
+	revision := event.Revision.String()
+	if !containsString(p.generations, revision) {
+		p.generations = append(p.generations, revision)
+	}
+	confirmed := p.confirmed
+	generations := p.generations
+	manual := append([]journal.ManualReview(nil), p.manual...)
+	p.mu.Unlock()
+	return p.persistCheckpoint(confirmed, generations, manual)
+}
+
+func containsString(values []string, target string) bool {
+	for _, v := range values {
+		if v == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Plant) observeFeed(value feed.Transition) {
